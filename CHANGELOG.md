@@ -10,3 +10,4 @@
 - Automatic underscore prepending for NPC alias filenames
 - Comma-separated multi-formID support for NPC aliases
 - Hook chains to Blockhead's handler when no suffix override found
+- Added PDB support
