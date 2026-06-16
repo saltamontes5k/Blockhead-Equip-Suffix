@@ -17,7 +17,7 @@ The plugin hooks `TESBipedModelForm::GetBodyPartModel`, computes the suffix path
 passes it to **Blockhead's handler** — Blockhead calls the engine and handles all
 downstream features (scripted overrides, per-NPC overrides, etc.).
 
-## 0.5a — now depends on Blockhead
+## 0.5a — now actually depends on Blockhead
 
 All override paths go through Blockhead's `SwapEquipmentModelData` handler.
 This plugin only computes WHICH suffix file to use; Blockhead does the rest.
@@ -78,7 +78,7 @@ msbuild BlockheadEquipSuffix.sln /p:Configuration=Release /p:Platform=Win32
 
 ## Dependencies
 
-- Blockhead (OBSE plugin) — must be loaded first
+- Blockhead (OBSE plugin) — must be loaded
 - Latest xOBSE
 
 ## Thanks
