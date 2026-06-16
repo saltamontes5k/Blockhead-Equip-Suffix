@@ -1,6 +1,6 @@
-# Blockhead EquipSuffix
+# Blockhead EquipSuffix  0.5a
 
-A companion OBSE plugin for Blockhead that provides suffix-based equipment model overrides.
+A lightweight companion plugin for **Blockhead** that provides suffix-based equipment model overrides alongside the original NIF files.
 
 ## How it works
 
@@ -9,18 +9,41 @@ A suffix (race group number or NPC alias) is appended to the filename before the
 
 ```
 Meshes\Armor\Iron\M\Greaves.nif        ← original
-Meshes\Armor\Iron\M\Greaves0.nif       ← race group 0 override
+Meshes\Armor\Iron\M\Greaves_0.nif      ← race group 0 override
 Meshes\Armor\Iron\M\Greaves_pconly.nif  ← NPC alias "_pconly" override
 ```
 
-The plugin hooks `TESBipedModelForm::GetBodyPartModel` and chains to Blockhead's
-existing handlers when no suffix override is found.
+The plugin hooks `TESBipedModelForm::GetBodyPartModel`, computes the suffix path, and
+passes it to **Blockhead's handler** — Blockhead calls the engine and handles all
+downstream features (scripted overrides, per-NPC overrides, etc.).
+
+## 0.5a — now depends on Blockhead
+
+All override paths go through Blockhead's `SwapEquipmentModelData` handler.
+This plugin only computes WHICH suffix file to use; Blockhead does the rest.
+
+## 0.5a Changes
+
+- **Diagnostic logging**: Writes to `Data\OBSE\Plugins\BlockheadEquipSuffix.log`.
+  Every override attempt logs NPC formID, original model path, constructed suffix
+  path, file existence check result, and chain/fallback decisions.
+- **`[Settings]` Logging toggle**: Set `Logging=0` in the INI to disable logging.
+  Defaults to ON.
+- **FileFinder fix**: Uses Oblivion's internal FileFinder (same as Blockhead) instead
+  of `GetFileAttributesA`, ensuring correct lookup across BSAs and loose files.
+- **Race name resolution**: Uses `GetFullName()` (same as Blockhead) instead of
+  `GetEditorID()` for correct handling of mod-added races.
+- **TESModel construction**: Properly calls the TESModel constructor to set up the
+  vftable, avoiding undefined behavior in the model cache.
 
 ## Configuration
 
 Place `BlockheadEquipSuffix.ini` in `Data\OBSE\Plugins\`:
 
 ```ini
+[Settings]
+Logging=1
+
 [EquipRaceGroups]
 0=Orc,Nord,Dremora
 1=Imperial,Breton,Redguard
@@ -29,17 +52,24 @@ Place `BlockheadEquipSuffix.ini` in `Data\OBSE\Plugins\`:
 ;pconly=00000007
 ;bigguys=00037FF8,000222B6
 ;mages=00034E16,00016487
-
 ```
 
-Race groups use the race's EditorID (the name shown in the Construction Set).
-NPC aliases are plain names — an underscore is prepended automatically.
+Race groups match against the race's display name (e.g. "Nord", "Orc").
+NPC aliases are plain names — an underscore is prepended automatically in the
+filename (e.g. alias `pconly` → `_pconly`).
+
+## Debugging
+
+When `Logging=1` (default), every suffix lookup is written to
+`Data\OBSE\Plugins\BlockheadEquipSuffix.log`.  Check this log if an override
+isn't being picked up — it shows exactly which path was constructed and whether
+the file was found.
 
 ## Building
 
 Requires:
 - Visual Studio 2022 with C++ desktop workload
-- xOBSE SDK (clone to `..\xOBSE-master\` relative to solution)
+- xOBSE SDK (clone as `xOBSE-master` sibling to `blockheadsuffix-v05`)
 - Common library (included with xOBSE)
 
 ```
