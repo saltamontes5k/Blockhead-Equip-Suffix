@@ -1,6 +1,6 @@
 # Blockhead EquipSuffix  v0.5d
 
-A lightweight companion plugin for **Blockhead** that provides suffix-based equipment model overrides alongside the original NIF files.
+A lightweight companion plugin for **Blockhead** that provides suffix-based equipment model overrides alongside the original NIF files. Also adds a scriptless invisible equipment system.
 
 ## How it works
 
