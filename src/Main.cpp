@@ -154,7 +154,7 @@ namespace EquipSuffix
 		}
 
 		Log("========================================");
-		Log(" BlockheadEquipSuffix  0.5c  initialising");
+		Log(" BlockheadEquipSuffix  0.5d  initialising");
 		Log("========================================");
 
 		char buffer[8192] = {};
@@ -362,7 +362,7 @@ namespace EquipSuffix
 
 		if (s_LogFile)
 		{
-			Log("BlockheadEquipSuffix 0.5c shutting down.");
+			Log("BlockheadEquipSuffix 0.5d shutting down.");
 			fclose(s_LogFile);
 			s_LogFile = nullptr;
 		}
@@ -573,7 +573,7 @@ extern "C"
 
 		WriteJump(kHookAddress, HookStub);
 		EquipSuffix::Log("[Hook] EquipSuffix installed at %08X", kHookAddress);
-		EquipSuffix::Log("BlockheadEquipSuffix 0.5c loaded successfully.");
+		EquipSuffix::Log("BlockheadEquipSuffix 0.5d loaded successfully.");
 
 		return true;
 	}
