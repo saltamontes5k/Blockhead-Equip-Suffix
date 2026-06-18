@@ -1,17 +1,16 @@
 # Blockhead EquipSuffix  v0.5d
 
-A lightweight companion plugin for **Blockhead** that provides suffix-based equipment model overrides alongside the original NIF files. Also adds a scriptless invisible equipment system.
+A lightweight companion plugin for **Blockhead** that provides suffix-based equipment model overrides alongside the original NIF files.
 
 ## How it works
 
 Instead of a separate override directory tree, override files live alongside the originals.
-A suffix (race group number, NPC alias, or faction alias) is appended to the filename before the extension.
+A suffix (race group number or NPC alias) is appended to the filename before the extension.
 
 ```
-Meshes\Armor\Iron\M\Greaves.nif              ← original
-Meshes\Armor\Iron\M\Greaves_0.nif            ← race group 0
-Meshes\Armor\Iron\M\Greaves_pconly.nif       ← NPC alias "pconly"
-Meshes\Armor\Iron\M\Greaves_FightersGuild.nif ← faction suffix
+Meshes\Armor\Iron\M\Greaves.nif        ← original
+Meshes\Armor\Iron\M\Greaves_0.nif      ← race group 0 override
+Meshes\Armor\Iron\M\Greaves_pconly.nif ← NPC alias "_pconly" override
 ```
 
 The plugin hooks `TESBipedModelForm::GetBodyPartModel`, computes the suffix path, and
@@ -25,11 +24,12 @@ This plugin only computes WHICH suffix file to use; Blockhead does the rest.
 
 ## Features
 
-- **Suffix cascade**: NPC alias → faction rank → race group → fallthrough to Blockhead
+- **Script priority**: Blockhead's `RegisterEquipmentOverrideHandler` system fires
+  inside every suffix override call and can override suffix results — scripts always win
+- **Suffix cascade**: NPC alias → race group → fallthrough to Blockhead
 - **Diagnostic logging**: Per-override log to `BlockheadEquipSuffix.log` with INI toggle
 - **Race groups**: Numbered suffixes per race display name
 - **NPC aliases**: Named suffixes per NPC formID
-- **Faction groups**: Rank-aware suffixes per faction formID (highest rank wins, ties broken by INI order)
 - **Slot-specific invisibility**: `[EquipInvisible]` section with `formID=Slot1,Slot2` syntax
 - **All vanilla checks**: Uses Oblivion's FileFinder, `GetFullName()` for races, proper TESModel construction
 
@@ -50,11 +50,6 @@ Logging=1
 ;bigguys=00037FF8,000222B6
 ;mages=00034E16,00016487
 
-[EquipFactionGroups]
-; <FactionFormID>=<minRank>,<Suffix>
-;0001E66C=0,FightersGuild
-;000223C8=1,MagesGuild
-
 [EquipInvisible]
 ; <NPCFormID> or <NPCFormID>=Slot1,Slot2,...
 ;00000007=Weapon,Shield
@@ -62,11 +57,29 @@ Logging=1
 
 ## Priority order (per-equipment-slot)
 
-1. **Invisible check** — if NPC in `[EquipInvisible]` and slot not visible → hide
-2. **NPC suffix** — `[EquipNPCGroups]` → file found? → apply
-3. **Faction suffix** — `[EquipFactionGroups]` → highest rank match → file found? → apply
-4. **Race suffix** — `[EquipRaceGroups]` → file found? → apply
-5. **Chain to Blockhead** — normal engine behaviour
+1. **Invisible check** — `[EquipInvisible]` → slot hidden
+2. **NPC suffix** — `[EquipNPCGroups]` → file found? → apply  
+3. **Race suffix** — `[EquipRaceGroups]` → file found? → apply
+4. **Chain to Blockhead** — runs scripted overrides (`RegisterEquipmentOverrideHandler`),
+   per-NPC overrides, and normal engine fallback
+
+Blockhead's script system runs inside every suffix override step (2–3) via
+`CallBlockhead`.  If a registered script replaces the body part model, it
+overrides the suffix result — scripts have the highest effective priority.
+
+## `_invisible.nif`
+
+For `[EquipInvisible]`, provide a valid zero-geometry NIF at
+`Data\Meshes\_invisible.nif`.  The engine loads it successfully and renders
+nothing — no missing-mesh error.  Included in `src\Data\meshes\_invisible.nif`.
+
+## Plans
+
+- **Faction suffix system** — rank-aware suffixes per faction formID
+  (`[EquipFactionGroups]`)
+- **Vanity bypass** — per-NPC and per-race slot hiding that shows the
+  race's default body underneath (`[EquipVanityBypass]`,
+  `[EquipRacialVanityBypass]`)
 
 ## Building
 

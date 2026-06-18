@@ -30,17 +30,16 @@
 ## [0.5a] - 2026-06-16
 
 ### Changed
-- Hard dependency on Blockhead — plugin requires Blockhead to load, no reinventing the wheel
-- All override and non-override paths now pass through Blockhead's handler, see above
+- Hard dependency on Blockhead — plugin requires Blockhead to load
+- All override and non-override paths now pass through Blockhead's handler
 - BodyPart=-1 resolved to correct part before logging (same as Blockhead)
-- Realism with version number
 
 ### Removed
 - Standalone engine original call (`kEngineOriginal`) — Blockhead handles everything
 - Standalone fallback code in chain paths
 - Unused `TESModel_Ctor` and `kTESModel_Ctor` constants
 
-## [R4] - 2026-06-16
+## [r4] - 2026-06-16
 
 ### Added
 - Diagnostic logging to `BlockheadEquipSuffix.log` with indented per-override detail
@@ -54,7 +53,7 @@
 - Override cascade: NPC suffix → race group suffix → chain to Blockhead
 
 ### Changed
-- Version bumped to Alpha4
+- Version bumped to 4
 - Build paths updated for sibling xOBSE-master directory layout
 
 ## [1.0.0] - 2026-06-15
