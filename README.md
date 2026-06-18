@@ -58,10 +58,13 @@ Logging=1
 ## Priority order (per-equipment-slot)
 
 1. **Invisible check** — `[EquipInvisible]` → slot hidden
-2. **NPC suffix** — `[EquipNPCGroups]` → file found? → apply  
-3. **Race suffix** — `[EquipRaceGroups]` → file found? → apply
-4. **Chain to Blockhead** — runs scripted overrides (`RegisterEquipmentOverrideHandler`),
-   per-NPC overrides, and normal engine fallback
+2. **Blockhead scripts** — registered `EquipmentOverride` handlers fire via Blockhead
+3. **NPC suffix** — `[EquipNPCGroups]` → file found? → apply
+4. **Race suffix** — `[EquipRaceGroups]` → file found? → apply
+5. **Chain to Blockhead** — normal engine behaviour (per-NPC overrides, scripted fallback)
+
+Steps 2–4 all pass through Blockhead's `SwapEquipmentModelData`, so Blockhead's
+scripted handlers fire for every suffix override and can override the result.
 
 Blockhead's script system runs inside every suffix override step (2–3) via
 `CallBlockhead`.  If a registered script replaces the body part model, it
