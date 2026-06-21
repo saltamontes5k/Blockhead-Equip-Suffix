@@ -9,14 +9,18 @@
 
 #include <windows.h>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <share.h>
+#include <intrin.h>
 
-static const UInt32 kHookAddress = 0x00469230;
+static constexpr UInt32 kHookAddress = 0x00469230;
+
 
 struct BodyPartData
 {
@@ -40,6 +44,24 @@ STATIC_ASSERT(sizeof(BodyPartData) == 0x10);
 STATIC_ASSERT(offsetof(ActorBodyModelData, bodyParts) == 0x4C);
 STATIC_ASSERT(offsetof(ActorBodyModelData, parentRef) == 0x150);
 
+static UInt32 GetModuleImageSize(HMODULE module)
+{
+	const UInt8* base = (const UInt8*)module;
+	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+	const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+	return nt->OptionalHeader.SizeOfImage;
+}
+
+static bool IsAddressInModule(UInt32 address, HMODULE module)
+{
+	UInt32 base = (UInt32)module;
+	UInt32 size = GetModuleImageSize(module);
+	if (!base || !size) return false;
+	return address >= base && address < base + size;
+}
+
 static void WriteJump(UInt32 addr, void* target)
 {
 	UInt32 rel = (UInt32)target - addr - 5;
@@ -48,14 +70,22 @@ static void WriteJump(UInt32 addr, void* target)
 	VirtualProtect((void*)addr, 5, PAGE_EXECUTE_READWRITE, &old);
 	memcpy((void*)addr, code, 5);
 	VirtualProtect((void*)addr, 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), (void*)addr, 5);
 }
 
 static void* ReadJumpTarget(UInt32 addr)
 {
-	BYTE* code = (BYTE*)addr;
-	if (code[0] != 0xE9) return nullptr;
-	UInt32 rel = *(UInt32*)(code + 1);
-	return (void*)(addr + 5 + rel);
+	__try
+	{
+		BYTE* code = (BYTE*)addr;
+		if (code[0] != 0xE9) return nullptr;
+		UInt32 rel = *(UInt32*)(code + 1);
+		return (void*)(addr + 5 + rel);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return nullptr;
+	}
 }
 
 static void __stdcall SuffixHandler(ActorBodyModelData*, TESForm*, TESModel*, int);
@@ -73,6 +103,7 @@ __declspec(naked) void HookStub()
 
 static PluginHandle g_pluginHandle = 0;
 static void* g_BlockheadHook = nullptr;
+
 
 static void CallBlockhead(ActorBodyModelData* ModelData, TESForm* ModelSource, TESModel* Model, int BodyPart)
 {
@@ -92,18 +123,20 @@ namespace EquipSuffix
 		static std::unordered_map<std::string, int>					s_RaceGroups;
 		static std::unordered_map<std::string, std::vector<UInt32>>	s_NPCGroups;
 		static std::unordered_map<UInt32, std::vector<UInt32>>		s_InvisibleNPCs;
-		static std::unordered_map<std::string, void*>				s_ModelCache;
+		static std::unordered_map<std::string, TESModel*>			s_ModelCache;
 
 	static FILE*	s_LogFile = nullptr;
 	static bool		s_LogEnabled = true;
 	static int		s_LogIndent = 0;
+	static int		s_LogFlushCounter = 0;
+	static char		s_IndentBuf[64] = {};
 
 	static void Log(const char* fmt, ...)
 	{
 		if (!s_LogEnabled || !s_LogFile) return;
 
-		for (int i = 0; i < s_LogIndent; i++)
-			fputs("  ", s_LogFile);
+		if (s_IndentBuf[0])
+			fputs(s_IndentBuf, s_LogFile);
 
 		va_list args;
 		va_start(args, fmt);
@@ -111,11 +144,42 @@ namespace EquipSuffix
 		va_end(args);
 
 		fputc('\n', s_LogFile);
-		fflush(s_LogFile);
+
+		if (++s_LogFlushCounter >= 16)
+		{
+			fflush(s_LogFile);
+			s_LogFlushCounter = 0;
+		}
 	}
 
-	static void LogIndent(void)  { s_LogIndent++; }
-	static void LogOutdent(void) { if (s_LogIndent > 0) s_LogIndent--; }
+	static void LogIndent(void)
+	{
+		s_LogIndent++;
+		if (s_LogIndent * 2 < (int)sizeof(s_IndentBuf) - 1)
+		{
+			s_IndentBuf[s_LogIndent * 2] = ' ';
+			s_IndentBuf[s_LogIndent * 2 - 1] = ' ';
+		}
+	}
+	static void LogOutdent(void)
+	{
+		if (s_LogIndent > 0)
+		{
+			s_LogIndent--;
+			s_IndentBuf[s_LogIndent * 2] = 0;
+		}
+	}
+
+	static void Trim(std::string& s)
+	{
+		while (!s.empty() && (s.back() == ' ' || s.back() == '\r')) s.pop_back();
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
+	}
+
+	static void Lowercase(std::string& s)
+	{
+		for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+	}
 
 	static bool FileExists(const char* path)
 	{
@@ -126,16 +190,30 @@ namespace EquipSuffix
 		return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
 	}
 
+	static void FreeCachedModels()
+	{
+		for (auto& [key, model] : s_ModelCache)
+		{
+			if (model)
+				FormHeap_Free(model);
+		}
+		s_ModelCache.clear();
+	}
+
 	static void ParseINI(void)
 	{
 		s_RaceGroups.clear();
 		s_NPCGroups.clear();
+		s_InvisibleNPCs.clear();
+		FreeCachedModels();
 
 		char sbuf[256] = {};
 		if (GetPrivateProfileStringA("Settings", "Logging", "1", sbuf, sizeof(sbuf),
 			"Data\\OBSE\\Plugins\\BlockheadEquipSuffix.ini"))
 		{
-			s_LogEnabled = (atoi(sbuf) != 0);
+			char* end = nullptr;
+			long val = strtol(sbuf, &end, 10);
+			s_LogEnabled = (end != sbuf && val != 0);
 		}
 
 		if (s_LogEnabled)
@@ -144,17 +222,14 @@ namespace EquipSuffix
 			if (!s_LogFile)
 			{
 				char alt[MAX_PATH];
-				for (int id = 1; id < 100; id++)
-				{
-					sprintf_s(alt, "Data\\OBSE\\Plugins\\BlockheadEquipSuffix_%d.log", id);
-					s_LogFile = _fsopen(alt, "w", _SH_DENYWR);
-					if (s_LogFile) break;
-				}
+				sprintf_s(alt, "Data\\OBSE\\Plugins\\BlockheadEquipSuffix_%lu.log",
+					GetCurrentProcessId());
+				s_LogFile = _fsopen(alt, "w", _SH_DENYWR);
 			}
 		}
 
 		Log("========================================");
-		Log(" BlockheadEquipSuffix  0.5d  initialising");
+		Log(" BlockheadEquipSuffix  0.5dd  initialising");
 		Log("========================================");
 
 		char buffer[8192] = {};
@@ -171,9 +246,10 @@ namespace EquipSuffix
 				std::string groupStr = line.substr(0, eq);
 				std::string races = line.substr(eq + 1);
 
-				while (!groupStr.empty() && groupStr.back() == ' ') groupStr.pop_back();
-				while (!groupStr.empty() && groupStr.front() == ' ') groupStr.erase(0, 1);
-				int groupNum = atoi(groupStr.c_str());
+				Trim(groupStr);
+				char* end = nullptr;
+				long groupNum = strtol(groupStr.c_str(), &end, 10);
+				if (end == groupStr.c_str() || groupNum < 0) continue;
 
 				size_t s = 0;
 				while (s < races.size())
@@ -183,13 +259,11 @@ namespace EquipSuffix
 						? races.substr(s) : races.substr(s, comma - s);
 					s = (comma == std::string::npos) ? races.size() : comma + 1;
 
-					while (!race.empty() && race.back() == ' ') race.pop_back();
-					while (!race.empty() && race.front() == ' ') race.erase(0, 1);
+					Trim(race);
 					if (race.empty()) continue;
 
-					std::string lower = race;
-					for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
-					s_RaceGroups[lower] = groupNum;
+					Lowercase(race);
+					s_RaceGroups[race] = groupNum;
 				}
 			}
 		}
@@ -208,8 +282,7 @@ namespace EquipSuffix
 				std::string alias = line.substr(0, eq);
 				std::string ids = line.substr(eq + 1);
 
-				while (!alias.empty() && alias.back() == ' ') alias.pop_back();
-				while (!alias.empty() && alias.front() == ' ') alias.erase(0, 1);
+				Trim(alias);
 				if (alias.empty()) continue;
 
 				size_t s = 0;
@@ -220,8 +293,7 @@ namespace EquipSuffix
 						? ids.substr(s) : ids.substr(s, comma - s);
 					s = (comma == std::string::npos) ? ids.size() : comma + 1;
 
-					while (!idStr.empty() && idStr.back() == ' ') idStr.pop_back();
-					while (!idStr.empty() && idStr.front() == ' ') idStr.erase(0, 1);
+					Trim(idStr);
 					if (idStr.empty()) continue;
 
 					UInt32 fid = 0;
@@ -247,13 +319,12 @@ namespace EquipSuffix
 			while (*p)
 			{
 				std::string line(p); p += line.size() + 1;
-				while (!line.empty() && (line.back() == ' ' || line.back() == '\r')) line.pop_back();
-				while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(0, 1);
+				Trim(line);
 				if (line.empty()) continue;
 
 				size_t eq = line.find('=');
 				std::string idPart = (eq == std::string::npos) ? line : line.substr(0, eq);
-				while (!idPart.empty() && idPart.back() == ' ') idPart.pop_back();
+				Trim(idPart);
 
 				UInt32 fid = 0;
 				if (sscanf_s(idPart.c_str(), "%x", &fid) != 1 || !fid) continue;
@@ -275,8 +346,7 @@ namespace EquipSuffix
 							? slots.substr(s) : slots.substr(s, comma - s);
 						s = (comma == std::string::npos) ? slots.size() : comma + 1;
 
-						while (!slotName.empty() && slotName.back() == ' ') slotName.pop_back();
-						while (!slotName.empty() && slotName.front() == ' ') slotName.erase(0, 1);
+						Trim(slotName);
 						if (slotName.empty()) continue;
 
 						for (size_t i = 0; i < kNumSlots; i++)
@@ -293,15 +363,16 @@ namespace EquipSuffix
 			}
 		}
 
-		Log("[INI] Loaded %zu race groups, %zu NPC groups, %zu invisible NPCs, logging=%s",
-			s_RaceGroups.size(), s_NPCGroups.size(), s_InvisibleNPCs.size(), s_LogEnabled ? "ON" : "OFF");
+		Log("[INI] %zu race groups, %zu NPC groups, %zu invisible, logging=%s",
+			s_RaceGroups.size(), s_NPCGroups.size(),
+			s_InvisibleNPCs.size(), s_LogEnabled ? "ON" : "OFF");
 	}
 
 	static int GetRaceGroup(const char* raceName)
 	{
 		if (!raceName) return -1;
 		std::string lower(raceName);
-		for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+		Lowercase(lower);
 		auto it = s_RaceGroups.find(lower);
 		return (it != s_RaceGroups.end()) ? it->second : -1;
 	}
@@ -325,25 +396,27 @@ namespace EquipSuffix
 		ActorBodyModelData* ModelData, TESForm* ModelSource, int BodyPart)
 	{
 		std::string key = overrideRel;
-		for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+		Lowercase(key);
 
 		TESModel* ovModel = nullptr;
 		auto it = s_ModelCache.find(key);
 		if (it != s_ModelCache.end())
 		{
-			ovModel = (TESModel*)it->second;
+			ovModel = it->second;
 			Log("Reusing cached TESModel @ %08X", (UInt32)ovModel);
 		}
 		else
 		{
 			ovModel = (TESModel*)FormHeap_Allocate(sizeof(TESModel));
 			memcpy(ovModel, Model, sizeof(TESModel));
-			memset(&ovModel->nifPath, 0, sizeof(BSStringT));
+			ovModel->nifPath.m_data = nullptr;
+			ovModel->nifPath.m_dataLen = 0;
+			ovModel->nifPath.m_bufLen = 0;
 			if (!overrideRel.empty())
-			ovModel->nifPath.Set(overrideRel.c_str());
+				ovModel->nifPath.Set(overrideRel.c_str());
 			s_ModelCache[key] = ovModel;
 			if (overrideRel.empty())
-				Log("Created TESModel @ %08X  path=(empty — slot hidden)", (UInt32)ovModel);
+				Log("Created TESModel @ %08X  path=(empty -- slot hidden)", (UInt32)ovModel);
 			else
 				Log("Created TESModel @ %08X  path=%s", (UInt32)ovModel, overrideRel.c_str());
 		}
@@ -358,185 +431,181 @@ namespace EquipSuffix
 		s_RaceGroups.clear();
 		s_NPCGroups.clear();
 		s_InvisibleNPCs.clear();
-		s_ModelCache.clear();
+		FreeCachedModels();
 
 		if (s_LogFile)
 		{
-			Log("BlockheadEquipSuffix 0.5d shutting down.");
+			Log("BlockheadEquipSuffix 0.5dd shutting down.");
 			fclose(s_LogFile);
 			s_LogFile = nullptr;
 		}
 	}
 }
 
+using namespace EquipSuffix;
+
+static bool TryApplyEquipSuffix(const std::string& base, const std::string& ext,
+	const char* suffix, const char* suffixDesc, TESModel* Model,
+	ActorBodyModelData* ModelData, TESForm* ModelSource, int BodyPart,
+	std::string& outAppliedPath)
+{
+	if (!suffix) return false;
+
+	std::string suffixedPath = base + '_' + suffix + ext;
+	Log("  %s suffix \"%s\"  ->  %s", suffixDesc, suffix, suffixedPath.c_str());
+
+	std::string fullPath = "Data\\Meshes\\" + suffixedPath;
+	if (FileExists(fullPath.c_str()))
+	{
+		Log("  File check: %s  ->  FOUND", fullPath.c_str());
+		ApplyTESModel(suffixedPath, Model, ModelData, ModelSource, BodyPart);
+		outAppliedPath = suffixedPath;
+		return true;
+	}
+	Log("  File check: %s  ->  not found", fullPath.c_str());
+	return false;
+}
+
 static void __stdcall SuffixHandler(ActorBodyModelData* ModelData, TESForm* ModelSource,
 									 TESModel* Model, int BodyPart)
 {
-	using namespace EquipSuffix;
-
-	if (ModelSource == nullptr)
-		goto chain;
-
+	if (!ModelSource || !ModelData)
 	{
-		TESObjectREFR* Ref = ModelData->parentRef;
-		if (!Ref || !Ref->baseForm || Ref->baseForm->typeID != kFormType_NPC)
+		CallBlockhead(ModelData, ModelSource, Model, BodyPart);
+		return;
+	}
+
+	TESObjectREFR* Ref = ModelData->parentRef;
+	if (!Ref || !Ref->baseForm || Ref->baseForm->typeID != kFormType_NPC)
+	{
+		Log("[Suffix] Ref not NPC (Ref=%08X), chaining", Ref ? Ref->refID : 0);
+		CallBlockhead(ModelData, ModelSource, Model, BodyPart);
+		return;
+	}
+
+	TESNPC* NPC = OBLIVION_CAST(Ref->baseForm, TESForm, TESNPC);
+	TESBipedModelForm* Biped = OBLIVION_CAST(ModelSource, TESForm, TESBipedModelForm);
+	if (!NPC)
+	{
+		CallBlockhead(ModelData, ModelSource, Model, BodyPart);
+		return;
+	}
+
+	if (!Biped)
+	{
+		CallBlockhead(ModelData, ModelSource, Model, BodyPart);
+		return;
+	}
+
+	Log("[Suffix] NPC=%08X  BodyPart=%d  Item=%s (%08X)",
+		NPC->refID, BodyPart,
+		ModelSource->GetEditorID() ? ModelSource->GetEditorID() : "?",
+		ModelSource->refID);
+	LogIndent();
+
+	if (BodyPart == -1)
+	{
+		unsigned long index;
+		if (_BitScanForward(&index, Biped->partMask))
+			BodyPart = (int)index;
+	}
+
+	const char* srcPath = Model->nifPath.m_data;
+	if (!srcPath || !srcPath[0])
+	{
+		Log("Source model path empty, chaining");
+		LogOutdent();
+		CallBlockhead(ModelData, ModelSource, Model, BodyPart);
+		return;
+	}
+
+	Log("Source path: %s", srcPath);
+
+	std::string_view srcView(srcPath);
+	size_t dot = srcView.rfind('.');
+	if (dot == std::string_view::npos)
+	{
+		Log("No extension in source path, chaining");
+		LogOutdent();
+		CallBlockhead(ModelData, ModelSource, Model, BodyPart);
+		return;
+	}
+
+	std::string base(srcView.substr(0, dot));
+	std::string ext(srcView.substr(dot));
+	bool applied = false;
+	std::string appliedPath;
+
+	const std::vector<UInt32>* visibleSlots = GetInvisibleVisibleSlots(NPC->refID);
+	if (visibleSlots && BodyPart >= 0)
+	{
+		bool slotVisible = false;
+		for (auto v : *visibleSlots)
+			if ((UInt32)BodyPart == v) { slotVisible = true; break; }
+
+		if (!slotVisible)
 		{
-			Log("[Suffix] Ref not NPC (Ref=%08X), chaining", Ref ? Ref->refID : 0);
-			goto chain;
-		}
-
-		TESNPC* NPC = OBLIVION_CAST(Ref->baseForm, TESForm, TESNPC);
-		TESBipedModelForm* Biped = OBLIVION_CAST(ModelSource, TESForm, TESBipedModelForm);
-		if (!Biped || !NPC)
-		{
-			Log("[Suffix] null Biped/NPC (NPC=%08X), chaining",
-				NPC ? NPC->refID : 0);
-			goto chain;
-		}
-
-		Log("[Suffix] NPC=%08X  BodyPart=%d  Item=%s (%08X)",
-			NPC->refID, BodyPart,
-			ModelSource->GetEditorID() ? ModelSource->GetEditorID() : "?",
-			ModelSource->refID);
-		LogIndent();
-
-		bool Female = NPC->actorBaseData.IsFemale();
-
-		if (BodyPart == -1)
-		{
-			UInt32 partID = 0;
-			while (partID < ActorBodyModelData::kBodyPart__MAX)
-			{
-				if (Biped->partMask & (1 << partID))
-					break;
-				partID++;
-			}
-			if (partID < ActorBodyModelData::kBodyPart__MAX)
-				BodyPart = partID;
-		}
-
-		const char* srcPath = Model->nifPath.m_data;
-		if (!srcPath || !srcPath[0])
-		{
-			Log("Source model path empty, chaining");
-			LogOutdent();
-			goto chain;
-		}
-
-		Log("Source path: %s", srcPath);
-
-		std::string path(srcPath);
-		size_t dot = path.rfind('.');
-		if (dot == std::string::npos)
-		{
-			Log("No extension in source path, chaining");
-			LogOutdent();
-			goto chain;
-		}
-
-		std::string base = path.substr(0, dot);
-		std::string ext  = path.substr(dot);
-		bool applied = false;
-		std::string appliedPath;
-
-		const std::vector<UInt32>* visibleSlots = EquipSuffix::GetInvisibleVisibleSlots(NPC->refID);
-		if (visibleSlots && BodyPart >= 0)
-		{
-			bool slotVisible = false;
+			Log("NPC %08X slot %d hidden (visible slots:", NPC->refID, BodyPart);
 			for (auto v : *visibleSlots)
-				if ((UInt32)BodyPart == v) { slotVisible = true; break; }
+				Log(" %d", v);
+			Log(")");
 
-			if (!slotVisible)
-			{
-				Log("NPC %08X slot %d hidden (visible slots:", NPC->refID, BodyPart);
-				for (auto v : *visibleSlots)
-					EquipSuffix::Log(" %d", v);
-				EquipSuffix::Log(")");
-
-				EquipSuffix::ApplyTESModel("_invisible.nif", Model, ModelData, ModelSource, BodyPart);
-				LogOutdent();
-				return;
-			}
-			else
-				Log("NPC %08X slot %d visible — proceeding normally", NPC->refID, BodyPart);
-		}
-
-		const char* npcSuffix = EquipSuffix::GetNPCSuffix(NPC->refID);
-		if (npcSuffix)
-		{
-			char buf[128];
-			sprintf_s(buf, "_%s", npcSuffix);
-			std::string npcPath = base + buf + ext;
-			Log("NPC suffix match: alias=\"%s\"  ->  %s", npcSuffix, npcPath.c_str());
-
-			std::string npcFullPath = "Data\\Meshes\\" + npcPath;
-			if (EquipSuffix::FileExists(npcFullPath.c_str()))
-			{
-				Log("File check: %s  ->  FOUND", npcFullPath.c_str());
-				applied = EquipSuffix::ApplyTESModel(npcPath, Model, ModelData, ModelSource, BodyPart);
-				if (applied) appliedPath = npcPath;
-			}
-			else
-				Log("File check: %s  ->  not found (falling through to race group)", npcFullPath.c_str());
-		}
-
-		if (!applied)
-		{
-			TESRace* Race = NPC->race.race;
-			const char* raceName = nullptr;
-
-			if (Race)
-			{
-				TESFullName* fn = Race->GetFullName();
-				if (fn && fn->name.m_data)
-					raceName = fn->name.m_data;
-			}
-
-			if (Race && raceName)
-			{
-				Log("Race: %s (%08X)  Female=%d", raceName, Race->refID, Female);
-
-				int group = EquipSuffix::GetRaceGroup(raceName);
-				if (group >= 0)
-				{
-					char buf[16];
-					sprintf_s(buf, "_%d", group);
-					std::string racePath = base + buf + ext;
-					Log("Race group %d match  ->  %s", group, racePath.c_str());
-
-					std::string raceFullPath = "Data\\Meshes\\" + racePath;
-					bool raceFound = EquipSuffix::FileExists(raceFullPath.c_str());
-					Log("File check: %s  ->  %s", raceFullPath.c_str(), raceFound ? "FOUND" : "not found");
-
-					if (raceFound)
-					{
-						applied = EquipSuffix::ApplyTESModel(racePath, Model, ModelData, ModelSource, BodyPart);
-						if (applied) appliedPath = racePath;
-					}
-				}
-				else
-					Log("Race \"%s\" not in any group", raceName);
-			}
-			else
-			{
-				if (Race)
-					Log("Race %08X has no full name", Race->refID);
-				else
-					Log("Race is NULL for NPC %08X", NPC->refID);
-			}
-		}
-
-		if (applied)
-		{
-			Log("OVERRIDE APPLIED  BodyPart=%d  ->  %s", BodyPart, appliedPath.c_str());
+			ApplyTESModel("_invisible.nif", Model, ModelData, ModelSource, BodyPart);
 			LogOutdent();
 			return;
 		}
-
-		LogOutdent();
+		else
+			Log("NPC %08X slot %d visible -- proceeding normally", NPC->refID, BodyPart);
 	}
 
-chain:
+	const char* npcSuffix = GetNPCSuffix(NPC->refID);
+	if (npcSuffix)
+	{
+		applied = TryApplyEquipSuffix(base, ext, npcSuffix, "NPC", Model, ModelData, ModelSource, BodyPart, appliedPath);
+	}
+
+	if (!applied)
+	{
+		TESRace* Race = NPC->race.race;
+		const char* raceName = nullptr;
+
+		if (Race)
+		{
+			TESFullName* fn = Race->GetFullName();
+			if (fn && fn->name.m_data)
+				raceName = fn->name.m_data;
+		}
+
+		if (Race && raceName)
+		{
+			Log("Race: %s (%08X)  Female=%d", raceName, Race->refID, NPC->actorBaseData.IsFemale());
+
+			int group = GetRaceGroup(raceName);
+			if (group >= 0)
+			{
+				std::string raceSuffix = std::to_string(group);
+				applied = TryApplyEquipSuffix(base, ext, raceSuffix.c_str(), "RaceGroup", Model, ModelData, ModelSource, BodyPart, appliedPath);
+			}
+			else
+				Log("Race \"%s\" not in any group", raceName);
+		}
+		else
+		{
+			if (Race)
+				Log("Race %08X has no full name", Race->refID);
+			else
+				Log("Race is NULL for NPC %08X", NPC->refID);
+		}
+	}
+
+	if (applied)
+	{
+		Log("OVERRIDE APPLIED  BodyPart=%d  ->  %s", BodyPart, appliedPath.c_str());
+		LogOutdent();
+		return;
+	}
+
+	LogOutdent();
 	Log("[Suffix] Chaining to downstream handler...");
 	CallBlockhead(ModelData, ModelSource, Model, BodyPart);
 }
@@ -565,16 +634,14 @@ extern "C"
 		g_BlockheadHook = ReadJumpTarget(kHookAddress);
 		if (!g_BlockheadHook)
 		{
-			EquipSuffix::Log("[Hook] ERROR: Blockhead not detected at %08X — plugin requires Blockhead", kHookAddress);
+			EquipSuffix::Log("[Hook] ERROR: No jmp target at %08X -- plugin requires Blockhead", kHookAddress);
 			return false;
 		}
 
-		EquipSuffix::Log("[Hook] Blockhead hook detected @ %08X", (UInt32)g_BlockheadHook);
-
+		EquipSuffix::Log("[Hook] Blockhead equipment hook detected @ %08X", (UInt32)g_BlockheadHook);
 		WriteJump(kHookAddress, HookStub);
 		EquipSuffix::Log("[Hook] EquipSuffix installed at %08X", kHookAddress);
-		EquipSuffix::Log("BlockheadEquipSuffix 0.5d loaded successfully.");
-
+		EquipSuffix::Log("BlockheadEquipSuffix 0.5dd loaded successfully.");
 		return true;
 	}
 }
