@@ -1,69 +1,50 @@
 # Changelog
 
+## [0.5dd] - 2026-06-21
+
+### Added
+- Planned: native BreakArmor replacement (`_ba{N}` suffix for health-based deterioration)
+- `FlushInstructionCache` in all WriteJump calls for reliable code patching
+- `IsAddressInModule` checks to verify Blockhead hooks before chaining
+- `__try/__except` guard in `ReadJumpTarget` for crash-safe hook reading
+- `_BitScanForward` for efficient partMask resolution (replaces 16-iteration loop)
+- Precomputed indent buffer for faster logging
+
+### Changed
+- Heavy refactor into single-file architecture (`Main.cpp`)
+- `atoi` replaced with `strtol` (proper error detection) for INI parsing
+- HandleBaseBody removed — base body invisibility dropped for stability
+
+### Removed
+- All face hook implementations (crashed with other plugins)
+- All faction system code (scope reduction)
+- `CoverInvisibleBody` setting and implementation
+- Body model trampoline hook
+- Vanity system (dropped from plans)
+
+### Fixed
+- Stack corruption in function hook stub (double cleanup of __stdcall params)
+- Instruction boundary alignment in trampoline (instruction-length decoder)
+
 ## [0.5d] - 2026-06-16
 
 ### Fixed
 - `[EquipInvisible]` head/hair slots no longer show missing-mesh errors.
   Hidden slots reference `Data\Meshes\_invisible.nif` — a valid zero-geometry
-  NIF that the engine loads successfully and renders nothing.  You must
-  provide `_invisible.nif` yourself (place any empty NIF at that path).
-
-## [0.5c] - 2026-06-16
-
-### Changed
-- `[EquipInvisible]` now supports slot-specific visibility:
-  `formID=Weapon,Shield` hides everything except Weapon and Shield.
-  Plain `formID` (no `=`) still hides all slots (backwards compatible).
-
-## [0.5b] - 2026-06-16
-
-### Fixed
-- Race group suffix no longer applies non-existent NIF paths (was calling
-  `ApplyTESModel` unconditionally regardless of `FileExists` result, causing
-  invisible equipment slots)
-
-### Added
-- `[EquipInvisible]` INI section — NPC formIDs listed here get all equipment
-  slots hidden (renders nothing for each slot).  Uses the same mechanism that
-  was causing invisible slots, but intentional.
-
-## [0.5a] - 2026-06-16
-
-### Changed
-- Hard dependency on Blockhead — plugin requires Blockhead to load
-- All override and non-override paths now pass through Blockhead's handler
-- BodyPart=-1 resolved to correct part before logging (same as Blockhead)
-
-### Removed
-- Standalone engine original call (`kEngineOriginal`) — Blockhead handles everything
-- Standalone fallback code in chain paths
-- Unused `TESModel_Ctor` and `kTESModel_Ctor` constants
+  NIF that the engine loads successfully and renders nothing.
 
 ## [r4] - 2026-06-16
 
 ### Added
 - Diagnostic logging to `BlockheadEquipSuffix.log` with indented per-override detail
 - `[Settings]` INI section with `Logging=1/0` toggle (default: ON)
-- Log entries for: NPC formID, source path, constructed override path, file existence, race null warnings, chain/fallback
-
-### Fixed
-- File existence check now uses Oblivion's internal FileFinder (same as Blockhead) instead of `GetFileAttributesA`, enabling BSA + loose file lookups
-- Race name resolution uses `GetFullName()` (same as Blockhead) instead of `GetEditorID()` for correct handling of mod-added races
-- Race group suffix now includes underscore (`_0` instead of `0`)
-- Override cascade: NPC suffix → race group suffix → chain to Blockhead
-
-### Changed
-- Version bumped to 4
-- Build paths updated for sibling xOBSE-master directory layout
+- File existence check uses Oblivion's internal FileFinder (BSA + loose file lookups)
+- Race name resolution uses `GetFullName()` for mod-added race support
 
 ## [1.0.0] - 2026-06-15
 
 ### Added
-- Initial release
-- Suffix-based equipment model overrides alongside original NIF files
-- Race group system via `[EquipRaceGroups]` INI section
-- NPC alias system via `[EquipNPCGroups]` INI section
-- Automatic underscore prepending for NPC alias filenames
-- Comma-separated multi-formID support for NPC aliases
-- Hook chains to Blockhead's handler when no suffix override found
-- Added PDB support
+- Initial release: equipment model suffix overrides alongside original NIFs
+- Race group system (`[EquipRaceGroups]`)
+- NPC alias system (`[EquipNPCGroups]`)
+- Hook chains to Blockhead when no suffix override found
