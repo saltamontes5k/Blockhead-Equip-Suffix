@@ -1,0 +1,8 @@
+.vs/
+src/Release/
+src/Debug/
+*.obj
+*.pdb
+*.iobj
+*.ipdb
+*.tlog
