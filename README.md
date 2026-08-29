@@ -9,14 +9,14 @@ engine — faction, class, race, inventory, location, weather, quest stage,
 quest variable, or game setting — so you can give different NPCs different
 gear and bodies purely by dropping files next to the originals.
 
-Built on **Blockhead** (ShadeMe). Requires only **Blockhead**.
+Built on **Blockhead** (ShadeMe). Requires xOBSE and **Blockhead**.
 
 ## Features
 
 - **Suffix override engine** — one `[EquipRules]` rule set drives every asset
   type: armor/clothing/weapon meshes, body meshes/textures, head
   meshes/textures, and body EGT.
-- **Native clauses** — no OBSEKeywords, no scripts: `fac:`, `race:`, `class:`,
+- **Native clauses** — no OBSEKeywords, no scripts, incredible flexibility and power: `fac:`, `race:`, `class:`,
   `npc:`, `inv:`, `ws:`, `cell:`, `qst:`, `qvar:`, `gst:`, `wtr:`.
 - **Body/head asset overrides** — per-race and per-NPC override folders, the
   same way Blockhead's body/head overrides work, but driven by the rule
@@ -33,10 +33,6 @@ Built on **Blockhead** (ShadeMe). Requires only **Blockhead**.
 1. [Blockhead](https://github.com/ShadeMe/Blockhead)
 2. xOBSE (OBSE 0021+)
 3. Oblivion 1.2.416
-
-Optional but recommended: [BlockheadEngineFixes](https://github.com/gnarlyman)
-(or the equivalent facegen-fix companion plugin) to stabilise the engine's
-facegen flood bug before enabling `[HeadOverride]`.
 
 ## Installation
 
@@ -99,21 +95,28 @@ case-insensitive.
 ; Rich player -> Cuirass_rich.nif / WaalxSword_rich.nif
 rich=inv:0000000F:>:10000
 
-; In the Oblivion planes
-plane=ws:0001A694
+; In any of the Oblivion plane worlds
+; (one rule per worldspace - clauses AND, so "ws:A, ws:B" never matches;
+; duplicate "plane=" rules with the same suffix give "any of" behavior)
+plane=ws:0003E50A
+plane=ws:0001D0BC
+plane=ws:0003F551
+plane=ws:0004A99F
+plane=ws:0002C5E4
+plane=ws:0004FAED
+plane=ws:0005222A
+plane=ws:00099C15
 
 ; Rainy weather
 rain=wtr:rain
 
-; Quest branch (Glarthir / Paranoia, stage 30 = help, 40 = told the guards)
-glar_help=npc:0001C1B2,qst:00023D80:>=:30,qst:00023D80:<:40
-glar_guard=npc:0001C1B2,qst:00023D80:>=:40
+; Quest branch (Glarthir / Paranoia, quest 00028D83, stage 50 = help,
+; 70 = told the guards, customize his look a bit)
+gally=npc:000294C3,qst:00028D83:>=:50,qst:00028D83:<:70
+gtattle=npc:000294C3,qst:00028D83:>=:70
 
 ; GMST-gated gear
 slowmo=gst:fGlobalTimeMultiplier:==:0.5
-
-; Quest-variable-gated gear
-paranoia=qvar:00023D80:prisonerCounter:>=:2
 
 ; Race-variant weapon (High Elf holds WaalxSword -> WaalxSword_elf.nif)
 elf=race:High Elf
@@ -173,7 +176,7 @@ Enabled=1
 
 While OFF the facegen detour is a pure passthrough. Enable it only with real
 `_blade`-style head assets, and pair it with an engine facegen fix (see
-Requirements) for stability.
+Requirements) for stability. Tbh do this even for regular blockhead.
 
 ## Legacy groups
 
@@ -197,8 +200,8 @@ BackWeapon SideWeapon Quiver Shield Torch Tail`.
   override for the same body/head asset, Blockhead's per-race/NPC/gender
   folders win (the plugin's suffixed path is preserved when Blockhead has no
   override).
-- **BES / BES-Keywords** — do not install alongside (same hooks).
-- **BlockheadEngineFixes** — compatible; recommended for facegen stability.
+- **BES / BES-Keywords** — do not install alongside OG (same hooks).
+- **BlockheadEngineFixes** — compatible; recommended for facegen stability. Find it on github
 
 ## Build
 
