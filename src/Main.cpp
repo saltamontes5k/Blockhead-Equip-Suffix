@@ -43,7 +43,7 @@ static constexpr UInt32 kBodyModelAHook    = 0x0047ABFA;   // Blockhead body mod
 static constexpr UInt32 kBodyModelBHook    = 0x00523934;   // Blockhead body model hook B
 static constexpr UInt32 kBodyEGTHookAddr   = 0x0052D612;   // Blockhead body EGT hook
 static constexpr UInt32 kBodyModelGetFn    = 0x0052BE80;   // TESRace_GetBodyModel (original getter)
-static constexpr UInt32 kHeadFaceGenFn     = 0x0052CD50;   // TESRace_GetFaceGenHeadParameters
+static constexpr UInt32 kHeadFaceGenFn     = 0x0052CD50;   // TESRace_BuildFaceGenRenderState
 
 // ------------------------------------------------------------
 //  Game data structures (mirrors Blockhead's layouts)
@@ -71,8 +71,22 @@ STATIC_ASSERT(sizeof(BodyPartData) == 0x10);
 STATIC_ASSERT(offsetof(ActorBodyModelData, bodyParts) == 0x4C);
 STATIC_ASSERT(offsetof(ActorBodyModelData, parentRef) == 0x150);
 
-// FaceGenHeadParameters (partial - only fields we touch). Offsets from Blockhead.
-struct FaceGenHeadParameters
+// FaceGenRenderState (partial - only fields we touch). The game builds this
+// at 0x52CD50. The component arrays are FaceGenPointerArray (NiTArray-like),
+// not raw TESModel**/count pairs. Offsets verified against the OctoberPass
+// export (FaceGenRenderState: headModels 0x74, headTextures 0x84,
+// raceFaceTextureData 0xB8, raceFaceTintData 0xBC).
+struct FaceGenPointerArray
+{
+	void*	vtable;			// 00
+	void**	data;			// 04
+	UInt16	capacity;		// 08
+	UInt16	firstFree;		// 0A
+	UInt16	objectCount;	// 0C
+	UInt16	growSize;		// 0E
+};
+
+struct FaceGenRenderState
 {
 	enum
 	{
@@ -88,19 +102,22 @@ struct FaceGenHeadParameters
 		kFaceGenData__END = 9,
 	};
 
-	UInt8		pad00[0x74];			// 00
-	TESModel**		models;				// 74  NiTArray<TESModel*>
-	UInt16			modelsNum;			// 78
-	UInt16			modelsCap;			// 7A
-	UInt8		pad7C[0x84 - 0x7C];		// 7C
-	TESTexture**	textures;			// 84  NiTArray<TESTexture*>
-	UInt16			texturesNum;		// 88
-	UInt16			texturesCap;		// 8A
-	UInt8		pad8C[0xB8 - 0x8C];		// 8C
-	TESModel*		eyeLeft;			// B8
-	TESModel*		eyeRight;			// BC
-	SInt32			unkC0;				// C0
+	UInt8				pad00[0x74];			// 00
+	FaceGenPointerArray	models;				// 74  headModels
+	FaceGenPointerArray	textures;			// 84  headTextures
+	FaceGenPointerArray	nodeNames;			// 94
+	FaceGenPointerArray	textureOverrides;	// A4
+	UInt8				useTextureOverrides;	// B4
+	UInt8				padB5[3];			// B5
+	void*				raceFaceTextureData;	// B8
+	void*				raceFaceTintData;		// BC
+	UInt32				renderFlags;		// C0
 };
+STATIC_ASSERT(sizeof(FaceGenPointerArray) == 0x10);
+STATIC_ASSERT(offsetof(FaceGenRenderState, models) == 0x74);
+STATIC_ASSERT(offsetof(FaceGenRenderState, textures) == 0x84);
+STATIC_ASSERT(offsetof(FaceGenRenderState, raceFaceTextureData) == 0xB8);
+STATIC_ASSERT(offsetof(FaceGenRenderState, raceFaceTintData) == 0xBC);
 
 static const char* kHeadComponentNames[] = { "Head","EarsMale","EarsFemale","Mouth","TeethLower","TeethUpper","Tongue","EyesLeft","EyesRight" };
 
@@ -126,19 +143,33 @@ static bool IsAddressInModule(UInt32 address, HMODULE module)
 	return address >= base && address < base + size;
 }
 
-static void WriteJump(UInt32 addr, void* target)
+// Validate a pointer discovered from a jump/call before calling it.
+static bool IsExecutableAddress(UInt32 address)
 {
+	MEMORY_BASIC_INFORMATION mbi = {};
+	if (!VirtualQuery((const void*)address, &mbi, sizeof(mbi))) return false;
+	if (mbi.State != MEM_COMMIT) return false;
+	DWORD protect = mbi.Protect & 0xFF;
+	return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
+		protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool WriteJump(UInt32 addr, void* target)
+{
+	if (!IsExecutableAddress(addr)) return false;
 	UInt32 rel = (UInt32)target - addr - 5;
 	BYTE code[5] = { 0xE9, (BYTE)rel, (BYTE)(rel >> 8), (BYTE)(rel >> 16), (BYTE)(rel >> 24) };
 	DWORD old;
-	VirtualProtect((void*)addr, 5, PAGE_EXECUTE_READWRITE, &old);
+	if (!VirtualProtect((void*)addr, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
 	memcpy((void*)addr, code, 5);
-	VirtualProtect((void*)addr, 5, old, &old);
+	if (!VirtualProtect((void*)addr, 5, old, &old)) return false;
 	FlushInstructionCache(GetCurrentProcess(), (void*)addr, 5);
+	return true;
 }
 
 static void* ReadJumpTarget(UInt32 addr)
 {
+	if (!IsExecutableAddress(addr)) return nullptr;
 	__try
 	{
 		BYTE* code = (BYTE*)addr;
@@ -155,6 +186,7 @@ static void* ReadJumpTarget(UInt32 addr)
 // Scan a stub for the first relative call (E8) and return its target.
 static void* FindCallTargetInStub(const void* stub, int maxBytes)
 {
+	if (!stub || !IsExecutableAddress((UInt32)stub)) return nullptr;
 	__try
 	{
 		const BYTE* p = (const BYTE*)stub;
@@ -185,13 +217,18 @@ static void* BuildTrampoline(UInt32 addr, UInt32 copyLen)
 	UInt32 rel = ((UInt32)addr + copyLen) - ((UInt32)tramp + copyLen) - 5;
 	code[0] = 0xE9;
 	*(UInt32*)(code + 1) = rel;
-	FlushInstructionCache(GetCurrentProcess(), tramp, copyLen + 5);
+	if (!FlushInstructionCache(GetCurrentProcess(), tramp, copyLen + 5))
+	{
+		VirtualFree(tramp, 0, MEM_RELEASE);
+		return nullptr;
+	}
 	return tramp;
 }
 
 // Patch `addr` with a jump to `target`, NOP-padding up to `copyLen` bytes.
-static void PatchJumpN(UInt32 addr, void* target, UInt32 copyLen)
+static bool PatchJumpN(UInt32 addr, void* target, UInt32 copyLen)
 {
+	if (copyLen < 5 || copyLen > 16 || !IsExecutableAddress(addr)) return false;
 	UInt32 rel = (UInt32)target - addr - 5;
 	BYTE code[16] = { 0 };
 	code[0] = 0xE9;
@@ -199,10 +236,11 @@ static void PatchJumpN(UInt32 addr, void* target, UInt32 copyLen)
 	for (UInt32 i = 5; i < copyLen; i++)
 		code[i] = 0x90;
 	DWORD old;
-	VirtualProtect((void*)addr, copyLen, PAGE_EXECUTE_READWRITE, &old);
+	if (!VirtualProtect((void*)addr, copyLen, PAGE_EXECUTE_READWRITE, &old)) return false;
 	memcpy((void*)addr, code, copyLen);
-	VirtualProtect((void*)addr, copyLen, old, &old);
+	if (!VirtualProtect((void*)addr, copyLen, old, &old)) return false;
 	FlushInstructionCache(GetCurrentProcess(), (void*)addr, copyLen);
+	return true;
 }
 
 // ------------------------------------------------------------
@@ -212,7 +250,7 @@ static void PatchJumpN(UInt32 addr, void* target, UInt32 copyLen)
 static void __cdecl  BBSBodyTextureHandler(TESRace* Race, UInt8 BodyPart, TESNPC* NPC, BSStringT* OutTexPath, const char* Format, const char* OrgTexPath);
 static TESModel* __stdcall BBSBodyModelHandler(TESNPC* NPC, TESRace* Race, UInt32 Gender, UInt32 BodyPart);
 static TESModel* __stdcall BBSBodyEGTHandler(TESNPC* NPC, UInt32 BodyPart, TESModel* Original);
-static void __stdcall DoHeadFaceGen(TESRace* Race, TESNPC* NPC, FaceGenHeadParameters* Params);
+static void __stdcall DoHeadFaceGen(TESRace* Race, TESNPC* NPC, FaceGenRenderState* Params);
 
 __declspec(naked) void BodyTextureHook()
 {
@@ -325,10 +363,11 @@ namespace EquipSuffix
 			std::string	strParam;
 			Op			op;
 			SInt32		num;
+			double		fnum;      // gst: float comparison value
 			UInt32		varIndex;
 			bool		byName;
 
-			RuleClause() : type(kType_NPC), formID(0), op(kOp_EQ), num(0), varIndex(0), byName(false) {}
+			RuleClause() : type(kType_NPC), formID(0), op(kOp_EQ), num(0), fnum(0.0), varIndex(0), byName(false) {}
 		};
 
 		struct EquipRule
@@ -348,11 +387,12 @@ namespace EquipSuffix
 		static std::vector<FormIdGroupEntry>	s_ClassGroups;
 
 		// ---- head override (facegen) ----
-		// MANDATORY: the facegen head detour applies per-NPC head model/texture
-		// overrides. Kept active by default; the reads are bounds-hardened and
-		// wrapped in SEH so a bad FaceGenParams entry degrades gracefully.
+		// OPT-IN: the facegen head detour applies per-NPC head model/texture
+		// overrides. Disabled by default; enable with [HeadOverride] Enabled=1.
+		// Reads are bounds-hardened and wrapped in SEH so a bad entry degrades
+		// gracefully.
 
-		static bool s_HeadOverride = true;
+		static bool s_HeadOverride = false;
 
 		static FILE*	s_LogFile = nullptr;
 		static bool		s_LogEnabled = true;
@@ -446,15 +486,15 @@ namespace EquipSuffix
 			return (UInt32)strtoul(s.c_str(), nullptr, 16);
 		}
 
-		static int ParseOp(const std::string& s)
+		static bool ParseOp(const std::string& s, RuleClause::Op& op)
 		{
-			if (s == "==") return RuleClause::kOp_EQ;
-			if (s == "!=") return RuleClause::kOp_NE;
-			if (s == "<=") return RuleClause::kOp_LE;
-			if (s == ">=") return RuleClause::kOp_GE;
-			if (s == "<")  return RuleClause::kOp_LT;
-			if (s == ">")  return RuleClause::kOp_GT;
-			return RuleClause::kOp_EQ;
+			if (s == "==") { op = RuleClause::kOp_EQ; return true; }
+			if (s == "!=") { op = RuleClause::kOp_NE; return true; }
+			if (s == "<=") { op = RuleClause::kOp_LE; return true; }
+			if (s == ">=") { op = RuleClause::kOp_GE; return true; }
+			if (s == "<")  { op = RuleClause::kOp_LT; return true; }
+			if (s == ">")  { op = RuleClause::kOp_GT; return true; }
+			return false;
 		}
 
 		static bool ParseClause(const std::string& raw, RuleClause& out)
@@ -528,7 +568,7 @@ namespace EquipSuffix
 				if (!IsHexToken(toks[1])) return false;
 				out.type = (type == "inv") ? RuleClause::kType_InvCount : RuleClause::kType_QuestStage;
 				out.formID = ParseHex(toks[1]);
-				out.op = (RuleClause::Op)ParseOp(toks[2]);
+				if (!ParseOp(toks[2], out.op)) return false;
 				out.num = (SInt32)strtol(toks[3].c_str(), nullptr, 10);
 				return true;
 			}
@@ -540,8 +580,9 @@ namespace EquipSuffix
 				out.formID = 0;
 				out.strParam = toks[1];
 				Trim(out.strParam);
-				out.op = (RuleClause::Op)ParseOp(toks[2]);
+				if (!ParseOp(toks[2], out.op)) return false;
 				out.num = (SInt32)strtol(toks[3].c_str(), nullptr, 10);
+				out.fnum = strtod(toks[3].c_str(), nullptr);
 				return !out.strParam.empty();
 			}
 			if (type == "qvar")
@@ -564,7 +605,7 @@ namespace EquipSuffix
 					out.byName = true;
 					Lowercase(out.strParam);
 				}
-				out.op = (RuleClause::Op)ParseOp(toks[3]);
+				if (!ParseOp(toks[3], out.op)) return false;
 				out.num = (SInt32)strtol(toks[4].c_str(), nullptr, 10);
 				return true;
 			}
@@ -597,6 +638,21 @@ namespace EquipSuffix
 			case RuleClause::kOp_LE: return value <= num;
 			case RuleClause::kOp_GT: return value > num;
 			case RuleClause::kOp_GE: return value >= num;
+			}
+			return false;
+		}
+
+		static bool CompareFloat(double value, RuleClause::Op op, double num)
+		{
+			const double eps = 1e-6;
+			switch (op)
+			{
+			case RuleClause::kOp_EQ: return std::fabs(value - num) <= eps;
+			case RuleClause::kOp_NE: return std::fabs(value - num) > eps;
+			case RuleClause::kOp_LT: return value < num;
+			case RuleClause::kOp_LE: return value <= num + eps;
+			case RuleClause::kOp_GT: return value > num;
+			case RuleClause::kOp_GE: return value >= num - eps;
 			}
 			return false;
 		}
@@ -755,7 +811,7 @@ namespace EquipSuffix
 				if (!GetGameSetting(c.strParam.c_str(), &info) || !info) return false;
 				switch (info->Type())
 				{
-				case SettingInfo::kSetting_Float:     return CompareNum((SInt32)info->f, c.op, c.num);
+				case SettingInfo::kSetting_Float:     return CompareFloat(info->f, c.op, c.fnum);
 				case SettingInfo::kSetting_Integer:  return CompareNum(info->i, c.op, c.num);
 				case SettingInfo::kSetting_Unsigned: return CompareNum((SInt32)info->u, c.op, c.num);
 				case SettingInfo::kSetting_Bool:     return CompareNum(info->b ? 1 : 0, c.op, c.num);
@@ -965,14 +1021,17 @@ namespace EquipSuffix
 				if (g_dataHandler && *g_dataHandler)
 				{
 					UInt8 modIndex = NPC->GetModIndex();
-					ModEntry::Data* plugin = (*g_dataHandler)->modsByID[modIndex];
-					if (plugin && plugin->name[0])
+					if (modIndex < 0xFF)	// 0xFF = savegame/dynamic form; modsByID[0xFF] is out of bounds
 					{
-						char npcPath[MAX_PATH] = {0};
-						sprintf_s(npcPath, "Characters\\%s\\PerNPC\\%s\\%08X_%s_%s%s",
-							GetOverrideFolderRoot(isHead), plugin->name, NPC->refID & 0xFFFFFF,
-							cat, componentName, ext.c_str());
-						candidates.push_back(npcPath);
+						ModEntry::Data* plugin = (*g_dataHandler)->modsByID[modIndex];
+						if (plugin && plugin->name[0])
+						{
+							char npcPath[MAX_PATH] = {0};
+							sprintf_s(npcPath, "Characters\\%s\\PerNPC\\%s\\%08X_%s_%s%s",
+								GetOverrideFolderRoot(isHead), plugin->name, NPC->refID & 0xFFFFFF,
+								cat, componentName, ext.c_str());
+							candidates.push_back(npcPath);
+						}
 					}
 				}
 			}
@@ -1014,7 +1073,7 @@ namespace EquipSuffix
 			}
 
 			// ---- [HeadOverride] ----
-			if (GetPrivateProfileStringA("HeadOverride", "Enabled", "1", sbuf, sizeof(sbuf), kINIPath))
+			if (GetPrivateProfileStringA("HeadOverride", "Enabled", "0", sbuf, sizeof(sbuf), kINIPath))
 			{
 				char* end = nullptr;
 				long val = strtol(sbuf, &end, 10);
@@ -1378,43 +1437,41 @@ using namespace EquipSuffix;
 		//  Head facegen overrides
 		// ============================================================
 
-		static void ApplyHeadOverrides(TESRace* Race, TESNPC* NPC, FaceGenHeadParameters* Params)
+		static void ApplyHeadOverrides(TESRace* Race, TESNPC* NPC, FaceGenRenderState* Params)
 		{
 			std::string cat = ResolveCategorySuffix(nullptr, NPC);
 			const char* catPtr = cat.empty() ? nullptr : cat.c_str();
 
 			if (!catPtr) return;
 
-			// bounds-harden the facegen component arrays: only touch components
-			// the game actually filled, and never beyond kFaceGenData__END
-			UInt32 modelCount = Params->modelsNum;
-			UInt32 textureCount = Params->texturesNum;
+			// Bounds-harden the facegen component arrays: only touch components
+			// the game actually filled, and never beyond kFaceGenData__END.
+			// firstFree is the next insertion index (the game fills 0..8).
+			UInt32 modelCount = Params->models.firstFree;
+			UInt32 textureCount = Params->textures.firstFree;
 			if (modelCount > 9) modelCount = 9;
 			if (textureCount > 9) textureCount = 9;
+
+			TESModel** modelData = (TESModel**)Params->models.data;
+			TESTexture** textureData = (TESTexture**)Params->textures.data;
 
 			for (UInt32 i = 0; i < modelCount; i++)
 			{
 				const char* comp = kHeadComponentNames[i];
+				if (!modelData || !modelData[i]) continue;
 
-				if (Params->models[i])
+				TESModel* m = modelData[i];
+				const char* p = m->nifPath.m_data;
+				if (p && p[0])
 				{
-					TESModel* m = Params->models[i];
-					const char* p = m->nifPath.m_data;
-					if (p && p[0])
+					std::string ovr = ResolveAssetOverride(p, catPtr, NPC, comp, true, kAsset_Model);
+					if (!ovr.empty())
 					{
-						std::string ovr = ResolveAssetOverride(p, catPtr, NPC, comp, true, kAsset_Model);
-						if (!ovr.empty())
+						TESModel* nm = CloneModelWithPath(m, ovr.c_str());
+						if (nm)
 						{
-							TESModel* nm = CloneModelWithPath(m, ovr.c_str());
-							if (nm)
-							{
-								Params->models[i] = nm;
-								if (i == FaceGenHeadParameters::kFaceGenData_EyesLeft)
-									Params->eyeLeft = nm;
-								else if (i == FaceGenHeadParameters::kFaceGenData_EyesRight)
-									Params->eyeRight = nm;
-								Log("[Head] model[%u] %s -> %s", i, comp, ovr.c_str());
-							}
+							modelData[i] = nm;
+							Log("[Head] model[%u] %s -> %s", i, comp, ovr.c_str());
 						}
 					}
 				}
@@ -1424,25 +1481,24 @@ using namespace EquipSuffix;
 			for (UInt32 i = 0; i < textureCount; i++)
 			{
 				const char* comp = kHeadComponentNames[i];
-				if (i == FaceGenHeadParameters::kFaceGenData_EyesLeft ||
-					i == FaceGenHeadParameters::kFaceGenData_EyesRight)
+				if (i == FaceGenRenderState::kFaceGenData_EyesLeft ||
+					i == FaceGenRenderState::kFaceGenData_EyesRight)
 					continue;
 
-				if (Params->textures[i])
+				if (!textureData || !textureData[i]) continue;
+
+				TESTexture* t = textureData[i];
+				const char* p = t->ddsPath.m_data;
+				if (p && p[0])
 				{
-					TESTexture* t = Params->textures[i];
-					const char* p = t->ddsPath.m_data;
-					if (p && p[0])
+					std::string ovr = ResolveAssetOverride(p, catPtr, NPC, comp, true, kAsset_Texture);
+					if (!ovr.empty())
 					{
-						std::string ovr = ResolveAssetOverride(p, catPtr, NPC, comp, true, kAsset_Texture);
-						if (!ovr.empty())
+						TESTexture* nt = CloneTextureWithPath(t, ovr.c_str());
+						if (nt)
 						{
-							TESTexture* nt = CloneTextureWithPath(t, ovr.c_str());
-							if (nt)
-							{
-								Params->textures[i] = nt;
-								Log("[Head] texture[%u] %s -> %s", i, comp, ovr.c_str());
-							}
+							textureData[i] = nt;
+							Log("[Head] texture[%u] %s -> %s", i, comp, ovr.c_str());
 						}
 					}
 				}
@@ -1574,11 +1630,11 @@ using namespace EquipSuffix;
 		//  Entry-detour handlers
 		// ============================================================
 
-		static void __stdcall DoHeadFaceGen(TESRace* Race, TESNPC* NPC, FaceGenHeadParameters* Params)
+		static void __stdcall DoHeadFaceGen(TESRace* Race, TESNPC* NPC, FaceGenRenderState* Params)
 		{
 			if (g_HeadFaceGenTrampoline)
 			{
-				typedef void (__fastcall *OrigFn)(TESRace*, void*, TESNPC*, FaceGenHeadParameters*);
+				typedef void (__fastcall *OrigFn)(TESRace*, void*, TESNPC*, FaceGenRenderState*);
 				((OrigFn)g_HeadFaceGenTrampoline)(Race, nullptr, NPC, Params);
 			}
 
@@ -1847,74 +1903,93 @@ static void InstallHooks(void)
 {
 	Log("[Hook] installing hooks");
 
-	// Blockhead must have installed its equipment hook and body/head hooks.
-	g_BlockheadEquipInner = FindCallTargetInStub(ReadJumpTarget(kEquipHookAddress), 24);
+	HMODULE game = GetModuleHandle(nullptr);
+	if (!game || !IsAddressInModule(kEquipHookAddress, game) || !IsAddressInModule(kHeadFaceGenFn, game))
+	{
+		Log("[Hook] ERROR: hook addresses are not inside the game module; aborting hook install");
+		return;
+	}
+
+	// Resolve the inner handler from Blockhead's E9 stub, validate it, then
+	// replace the hook with our stub. Returns the inner handler on success.
+	auto resolve = [](const char* name, UInt32 hookAddr, void* replacement) -> void*
+	{
+		void* stub = ReadJumpTarget(hookAddr);
+		if (!stub || !IsExecutableAddress((UInt32)stub))
+		{
+			Log("[Hook] ERROR: no valid Blockhead %s hook at %08X", name, hookAddr);
+			return nullptr;
+		}
+		void* inner = FindCallTargetInStub(stub, 24);
+		if (!inner || !IsExecutableAddress((UInt32)inner))
+		{
+			Log("[Hook] ERROR: invalid Blockhead %s handler at %08X", name, hookAddr);
+			return nullptr;
+		}
+		if (!WriteJump(hookAddr, replacement))
+		{
+			Log("[Hook] ERROR: could not patch %s hook at %08X", name, hookAddr);
+			return nullptr;
+		}
+		return inner;
+	};
+
+	g_BlockheadEquipInner = resolve("equipment", kEquipHookAddress, (void*)EquipHookStub);
 	if (g_BlockheadEquipInner)
-	{
-		Log("[Hook] Blockhead equipment handler @ %08X", (UInt32)g_BlockheadEquipInner);
-		WriteJump(kEquipHookAddress, (void*)EquipHookStub);
-		Log("[Hook] BlockheadEquipSuffix equipment hook installed at %08X", kEquipHookAddress);
-	}
-	else
-		Log("[Hook] ERROR: no Blockhead equipment hook at %08X", kEquipHookAddress);
+		Log("[Hook] Blockhead equipment handler @ %08X; equipment hook installed", (UInt32)g_BlockheadEquipInner);
 
-	// Body asset hooks
-	void* texStub = ReadJumpTarget(kBodyTexHookAddr);
-	if (texStub)
-	{
-		g_BlockheadTexInner = FindCallTargetInStub(texStub, 24);
-		WriteJump(kBodyTexHookAddr, (void*)BodyTextureHook);
-		Log("[Hook] BlockheadEquipSuffix body texture hook installed at %08X (blockhead inner @ %08X)",
-			kBodyTexHookAddr, (UInt32)g_BlockheadTexInner);
-	}
-	else
-		Log("[Hook] ERROR: no Blockhead body texture hook at %08X", kBodyTexHookAddr);
+	g_BlockheadTexInner = resolve("body texture", kBodyTexHookAddr, (void*)BodyTextureHook);
+	if (g_BlockheadTexInner)
+		Log("[Hook] body texture hook installed (blockhead inner @ %08X)", (UInt32)g_BlockheadTexInner);
 
-	void* modelAStub = ReadJumpTarget(kBodyModelAHook);
-	if (modelAStub)
+	void* innerA = resolve("body model A", kBodyModelAHook, (void*)BodyModelAHook);
+	if (innerA)
 	{
-		g_BlockheadModelInner = FindCallTargetInStub(modelAStub, 24);
-		WriteJump(kBodyModelAHook, (void*)BodyModelAHook);
-		Log("[Hook] BlockheadEquipSuffix body model A hook installed at %08X", kBodyModelAHook);
+		g_BlockheadModelInner = innerA;
+		Log("[Hook] body model A hook installed (blockhead inner @ %08X)", (UInt32)innerA);
 	}
-	else
-		Log("[Hook] ERROR: no Blockhead body model hook A at %08X", kBodyModelAHook);
 
-	void* modelBStub = ReadJumpTarget(kBodyModelBHook);
-	if (modelBStub)
+	void* innerB = resolve("body model B", kBodyModelBHook, (void*)BodyModelBHook);
+	if (innerB)
 	{
 		if (!g_BlockheadModelInner)
-			g_BlockheadModelInner = FindCallTargetInStub(modelBStub, 24);
-		WriteJump(kBodyModelBHook, (void*)BodyModelBHook);
-		Log("[Hook] BlockheadEquipSuffix body model B hook installed at %08X", kBodyModelBHook);
+			g_BlockheadModelInner = innerB;
+		Log("[Hook] body model B hook installed (blockhead inner @ %08X)", (UInt32)innerB);
 	}
-	else
-		Log("[Hook] ERROR: no Blockhead body model hook B at %08X", kBodyModelBHook);
 
-	void* egtStub = ReadJumpTarget(kBodyEGTHookAddr);
-	if (egtStub)
-	{
-		g_BlockheadEGTInner = FindCallTargetInStub(egtStub, 24);
-		WriteJump(kBodyEGTHookAddr, (void*)BodyEGTHook);
-		Log("[Hook] BlockheadEquipSuffix body EGT hook installed at %08X (blockhead inner @ %08X)",
-			kBodyEGTHookAddr, (UInt32)g_BlockheadEGTInner);
-	}
-	else
-		Log("[Hook] ERROR: no Blockhead body EGT hook at %08X", kBodyEGTHookAddr);
+	g_BlockheadEGTInner = resolve("body EGT", kBodyEGTHookAddr, (void*)BodyEGTHook);
+	if (g_BlockheadEGTInner)
+		Log("[Hook] body EGT hook installed (blockhead inner @ %08X)", (UInt32)g_BlockheadEGTInner);
 
-	// Head facegen entry detour.
-	// First instructions at 0x52CD50: "6A FF" (push 0xFF, 2 bytes) +
-	// "68 08 6B 9D 00" (push offset, 5 bytes) = 7 bytes total, ending
-	// right before the SEH registration (mov eax, fs:0). Copy exactly 7.
-	g_HeadFaceGenTrampoline = BuildTrampoline(kHeadFaceGenFn, 7);
-	if (g_HeadFaceGenTrampoline)
+	// Head facegen entry detour (opt-in).
+	// Vanilla first instructions at 0x52CD50: "6A FF" (push -1, 2 bytes) +
+	// "68 08 6B 9D 00" (push SEH offset, 5 bytes) = 7 bytes, ending right
+	// before the SEH registration (mov eax, fs:0). Copy exactly 7.
+	if (!EquipSuffix::s_HeadOverride)
 	{
-		PatchJumpN(kHeadFaceGenFn, (void*)HeadFaceGenHook, 7);
-		Log("[Hook] BlockheadEquipSuffix head facegen detour installed at %08X (trampoline @ %08X)",
-			kHeadFaceGenFn, (UInt32)g_HeadFaceGenTrampoline);
+		Log("[Hook] head facegen detour disabled by INI; leaving 0x%08X untouched", kHeadFaceGenFn);
 	}
 	else
-		Log("[Hook] ERROR: could not build head facegen trampoline at %08X", kHeadFaceGenFn);
+	{
+		if (*(const BYTE*)kHeadFaceGenFn != 0x6A)
+			Log("[Hook] WARNING: 0x%08X does not start with vanilla 'push -1'; another hook may already be present", kHeadFaceGenFn);
+
+		g_HeadFaceGenTrampoline = BuildTrampoline(kHeadFaceGenFn, 7);
+		if (g_HeadFaceGenTrampoline)
+		{
+			if (PatchJumpN(kHeadFaceGenFn, (void*)HeadFaceGenHook, 7))
+				Log("[Hook] head facegen detour installed at %08X (trampoline @ %08X)",
+					kHeadFaceGenFn, (UInt32)g_HeadFaceGenTrampoline);
+			else
+			{
+				Log("[Hook] ERROR: could not patch head facegen detour at %08X", kHeadFaceGenFn);
+				VirtualFree(g_HeadFaceGenTrampoline, 0, MEM_RELEASE);
+				g_HeadFaceGenTrampoline = nullptr;
+			}
+		}
+		else
+			Log("[Hook] ERROR: could not build head facegen trampoline at %08X", kHeadFaceGenFn);
+	}
 
 	if (EquipSuffix::s_LogFile) fflush(EquipSuffix::s_LogFile);
 }

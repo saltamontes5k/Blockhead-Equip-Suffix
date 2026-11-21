@@ -167,7 +167,8 @@ Head components: `Head`, `EarsMale`, `EarsFemale`, `Mouth`, `TeethLower`,
 
 ### `[HeadOverride]`
 
-The facegen head override runs inside the live facegen pipeline and is opt-in:
+The facegen head override runs inside the live facegen pipeline and is
+opt-in and **off by default**:
 
 ```
 [HeadOverride]
