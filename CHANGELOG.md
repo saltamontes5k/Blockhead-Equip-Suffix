@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha] - 2026-11-26 — Clause Edition
+
+First alpha of the native clause engine. The shipped example INI now carries
+commented `[EquipRules]` clause examples while keeping all groups opt-in.
+
 ### Fixed
 - **Facegen head overrides** — read `FaceGenRenderState::headModels` /
   `headTextures` as `FaceGenPointerArray` (vtable/data/capacity/firstFree)
